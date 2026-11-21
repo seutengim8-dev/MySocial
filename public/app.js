@@ -2,7 +2,7 @@ const $=id=>document.getElementById(id);let me=null,users=[],active=null,groups=
 async function api(url,opt={}){let r=await fetch(url,{...opt,headers:{"Content-Type":"application/json",...(opt.headers||{})}}),d=await r.json().catch(()=>({}));if(!r.ok)throw Error(d.error||"요청 실패");return d}
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 function toast(t){$("toasts").textContent=t;$("toasts").className="toast";setTimeout(()=>$("toasts").className="",2500)}
-function enter(){ $("authView").classList.add("hidden");$("appView").classList.remove("hidden");$("topName").textContent=me.display_name;$("meName").textContent=me.display_name;refresh();clearInterval(poll);poll=setInterval(()=>{refresh(false);if(active)loadDM();else if(activeGroup)chooseGroup(activeGroup);else if($("chatTitle").textContent==="나와의 채팅")loadSelfNotes();heartbeat();checkCallInbox();syncCall();refreshPresence()},2500)}
+function enter(){ if("serviceWorker"in navigator)navigator.serviceWorker.register("/sw.js").catch(()=>{}); $("authView").classList.add("hidden");$("appView").classList.remove("hidden");$("topName").textContent=me.display_name;$("meName").textContent=me.display_name;refresh();clearInterval(poll);poll=setInterval(()=>{refresh(false);if(active)loadDM();else if(activeGroup)chooseGroup(activeGroup);else if($("chatTitle").textContent==="나와의 채팅")loadSelfNotes();heartbeat();checkCallInbox();syncCall();refreshPresence()},2500)}
 async function refresh(){try{let [u,g]=await Promise.all([api("/api/users"),api("/api/groups")]);users=u.users;groups=g.groups;renderUsers();renderGroups();renderRecent()}catch{}}
 async function login(){try{me=(await api("/api/login",{method:"POST",body:JSON.stringify({email:$("email").value,password:$("password").value})})).user;enter()}catch(e){$("authMsg").textContent=e.message}}
 $("signIn").onclick=login;$("signUp").onclick=async()=>{try{me=(await api("/api/register",{method:"POST",body:JSON.stringify({email:$("email").value,password:$("password").value,displayName:$("displayName").value})})).user;enter()}catch(e){$("authMsg").textContent=e.message}};
@@ -32,20 +32,27 @@ $("reelUpload").onclick=()=>$("reelModal").classList.remove("hidden");$("reelCan
 
 // Peer-to-peer browser voice calls (microphone permission required)
 async function heartbeat(){try{await api("/api/presence",{method:"POST"})}catch{}}
+let pendingLocalIce=[],pendingRemoteIce=[];
+async function flushRemoteIce(){if(!rtc?.remoteDescription)return;const queued=pendingRemoteIce.splice(0);for(const candidate of queued){try{await rtc.addIceCandidate(new RTCIceCandidate(candidate))}catch(e){console.warn("ICE 후보 적용 실패:",e.message)}}}
 async function makePeer(){
- rtc=new RTCPeerConnection({iceServers:[{urls:"stun:stun.l.google.com:19302"}]});
- const stream=await navigator.mediaDevices.getUserMedia({audio:true,video:false});
+ let rtcConfig={iceServers:[{urls:"stun:stun.l.google.com:19302"},{urls:"stun:stun1.l.google.com:19302"}],iceCandidatePoolSize:4};try{rtcConfig={...rtcConfig,...await api("/api/rtc/config")}}catch{}
+ rtc=new RTCPeerConnection(rtcConfig);
+ const stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false});
  stream.getTracks().forEach(t=>rtc.addTrack(t,stream));
- rtc.ontrack=e=>$("remoteAudio").srcObject=e.streams[0];
- rtc.onicecandidate=e=>{if(e.candidate&&callId)api(`/api/calls/${callId}/ice`,{method:"POST",body:JSON.stringify({candidate:e.candidate})}).catch(()=>{})};
+ rtc.ontrack=async e=>{const a=$("remoteAudio");const stream=e.streams?.[0]||new MediaStream([e.track]);if(a.srcObject!==stream)a.srcObject=stream;a.autoplay=true;a.playsInline=true;a.muted=false;a.volume=1;try{await a.play();$("audioEnableBtn").classList.add("hidden")}catch{$("audioEnableBtn").classList.remove("hidden")}};
+ rtc.onicecandidate=e=>{if(e.candidate){if(callId)api(`/api/calls/${callId}/ice`,{method:"POST",body:JSON.stringify({candidate:e.candidate})}).catch(()=>{});else pendingLocalIce.push(e.candidate.toJSON())}};
+ rtc.onconnectionstatechange=()=>{if($("callStatus"))$("callStatus").textContent=rtc?.connectionState==="connected"?"통화 연결됨 🎙️":`연결 상태: ${rtc?.connectionState||"대기"}`};
+ rtc.oniceconnectionstatechange=()=>{if(rtc?.iceConnectionState==="failed")toast("통화 네트워크 연결에 실패했어. TURN 서버 설정이 필요할 수 있어.")};
 }
+async function flushLocalIce(){if(!callId||!pendingLocalIce.length)return;const list=pendingLocalIce.splice(0);for(const candidate of list)api(`/api/calls/${callId}/ice`,{method:"POST",body:JSON.stringify({candidate})}).catch(()=>{})}
+
 $("callBtn").onclick=async()=>{
  if(!active)return;
  try{
   if(!navigator.mediaDevices?.getUserMedia)throw Error("마이크는 localhost 또는 HTTPS에서 사용할 수 있어.");
   await makePeer();let offer=await rtc.createOffer();await rtc.setLocalDescription(offer);
   let d=await api("/api/calls",{method:"POST",body:JSON.stringify({to:active.id,offer:rtc.localDescription})});
-  callId=d.call.id;callRole="caller";remoteIceSeen=0;
+  callId=d.call.id;callRole="caller";remoteIceSeen=0;await flushLocalIce();
   $("callTitle").textContent=active.display_name+"에게 전화 중";$("callStatus").textContent="상대방 응답을 기다리는 중...";$("callModal").classList.remove("hidden");
  }catch(e){toast(e.message);if(rtc){rtc.close();rtc=null}}
 };
@@ -54,10 +61,11 @@ async function checkCallInbox(){
  try{
   let c=(await api("/api/calls/inbox")).call;if(!c||c.id===seenIncoming)return;seenIncoming=c.id;
   let caller=users.find(u=>u.id===c.from);
-  if(!confirm((caller?.display_name||"사용자")+" 님의 음성 통화야. 받을까?")){await api(`/api/calls/${c.id}`,{method:"PATCH",body:JSON.stringify({status:"rejected"})});return}
+  startRing();
+  if(!confirm((caller?.display_name||"사용자")+" 님의 음성 통화야. 받을까?")){stopTone();await api(`/api/calls/${c.id}`,{method:"PATCH",body:JSON.stringify({status:"rejected"})});return}
   if(!navigator.mediaDevices?.getUserMedia)throw Error("마이크는 localhost 또는 HTTPS에서 사용할 수 있어.");
-  callId=c.id;callRole="callee";remoteIceSeen=0;await makePeer();
-  await rtc.setRemoteDescription(new RTCSessionDescription(c.offer));
+  stopTone();callId=c.id;callRole="callee";remoteIceSeen=0;await makePeer();
+  await rtc.setRemoteDescription(new RTCSessionDescription(c.offer));await flushRemoteIce();
   let answer=await rtc.createAnswer();await rtc.setLocalDescription(answer);
   await api(`/api/calls/${callId}`,{method:"PATCH",body:JSON.stringify({status:"accepted",answer:rtc.localDescription})});
   $("callTitle").textContent=(caller?.display_name||"사용자")+" 님과 통화 중";$("callStatus").textContent="연결 중...";$("callModal").classList.remove("hidden");
@@ -68,20 +76,36 @@ async function syncCall(){
  try{
   let c=(await api(`/api/calls/${callId}`)).call;
   if(["rejected","ended"].includes(c.status)){toast(c.status==="rejected"?"상대방이 전화를 거절했어.":"통화가 종료됐어.");hangup(false);return}
-  if(callRole==="caller"&&c.answer&&!rtc.currentRemoteDescription)await rtc.setRemoteDescription(new RTCSessionDescription(c.answer));
+  if(callRole==="caller"&&c.answer&&!rtc.currentRemoteDescription){await rtc.setRemoteDescription(new RTCSessionDescription(c.answer));await flushRemoteIce()}
   let ice=callRole==="caller"?c.toIce:c.fromIce;
-  while(remoteIceSeen<ice.length){try{await rtc.addIceCandidate(new RTCIceCandidate(ice[remoteIceSeen]))}catch{}remoteIceSeen++}
+  while(remoteIceSeen<ice.length){const candidate=ice[remoteIceSeen++];if(!rtc.remoteDescription)pendingRemoteIce.push(candidate);else{try{await rtc.addIceCandidate(new RTCIceCandidate(candidate))}catch(e){console.warn("ICE 후보 적용 실패:",e.message)}}}
   $("callStatus").textContent=rtc.connectionState==="connected"?"통화 연결됨 🎙️":"상대방과 연결 중...";
  }catch{}
 }
 async function hangup(notify=true){
  let old=callId;if(notify&&old)try{await api(`/api/calls/${old}`,{method:"PATCH",body:JSON.stringify({status:"ended"})})}catch{}
  if(rtc){rtc.getSenders().forEach(x=>x.track?.stop());rtc.close();rtc=null}
- callId=null;callRole=null;$("remoteAudio").srcObject=null;$("callModal").classList.add("hidden");muted=false;
+ callId=null;callRole=null;pendingRemoteIce=[];$("remoteAudio").srcObject=null;$("audioEnableBtn").classList.add("hidden");$("callModal").classList.add("hidden");muted=false;pendingLocalIce=[];stopTone();
 }
 $("hangupBtn").onclick=()=>hangup();
 $("muteBtn").onclick=()=>{if(!rtc)return;muted=!muted;rtc.getSenders().forEach(x=>{if(x.track?.kind==="audio")x.track.enabled=!muted});$("muteBtn").textContent=muted?"마이크 켜기":"마이크 음소거"};
 
+
+$("audioEnableBtn").onclick=async()=>{try{await $("remoteAudio").play();$("audioEnableBtn").classList.add("hidden")}catch{toast("오디오 재생을 허용해 줘.")}};
+// Lightweight Web Audio tones; sound starts after a user gesture or incoming-call event.
+let toneContext=null,toneTimer=null,toneOsc=[];
+function stopTone(){if(toneTimer)clearInterval(toneTimer);toneTimer=null;toneOsc.forEach(o=>{try{o.stop()}catch{}});toneOsc=[]}
+function playTone(freq=660,duration=.18){try{toneContext=toneContext||new (window.AudioContext||window.webkitAudioContext)();if(toneContext.state==="suspended")toneContext.resume();const o=toneContext.createOscillator(),g=toneContext.createGain();o.frequency.value=freq;o.type="sine";g.gain.setValueAtTime(.0001,toneContext.currentTime);g.gain.exponentialRampToValueAtTime(.12,toneContext.currentTime+.02);g.gain.exponentialRampToValueAtTime(.0001,toneContext.currentTime+duration);o.connect(g);g.connect(toneContext.destination);o.start();o.stop(toneContext.currentTime+duration+.03)}catch{}}
+function startRing(){stopTone();playTone(740,.25);toneTimer=setInterval(()=>{playTone(740,.25);setTimeout(()=>playTone(880,.25),330)},1500)}
+// Server-synchronised alarms plus Web Push for supported mobile/desktop browsers.
+let serverAlarms=[];
+async function loadAlarms(){try{serverAlarms=(await api("/api/alarms")).alarms;renderAlarms()}catch(e){toast(e.message)}}
+function renderAlarms(){const el=$("alarmList");if(!el)return;el.innerHTML=serverAlarms.map(a=>`<div class="userrow"><span style="flex:1">⏰ <b>${new Date(a.fireAt).toLocaleString("ko-KR",{month:"numeric",day:"numeric",hour:"2-digit",minute:"2-digit"})}</b> ${esc(a.label)} ${a.repeat?"(매일)":""}</span><button class="ghost mini" data-alarm-del="${a.id}">삭제</button></div>`).join("")||'<p class="sub">등록된 알람이 없어.</p>';el.querySelectorAll("[data-alarm-del]").forEach(b=>b.onclick=async()=>{try{await api("/api/alarms/"+b.dataset.alarmDel,{method:"DELETE"});await loadAlarms()}catch(e){toast(e.message)}})}
+async function enablePush(){try{if(!("serviceWorker"in navigator)||!("PushManager"in window))throw Error("이 브라우저는 푸시 알림을 지원하지 않아.");const k=await api("/api/push/public-key");if(!k.enabled)throw Error("서버의 VAPID 푸시 설정이 아직 필요해.");const permission=await Notification.requestPermission();if(permission!=="granted")throw Error("알림 권한을 허용해 줘.");const reg=await navigator.serviceWorker.register("/sw.js");let sub=await reg.pushManager.getSubscription();if(!sub)sub=await reg.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:Uint8Array.from(atob(k.publicKey.replace(/-/g,"+").replace(/_/g,"/")+"=".repeat((4-k.publicKey.length%4)%4)),c=>c.charCodeAt(0))});await api("/api/push/subscribe",{method:"POST",body:JSON.stringify({subscription:sub})});toast("이 기기에서 푸시 알림을 받을 수 있어!")}catch(e){toast(e.message)}}
+$("alarmBtn").onclick=async()=>{$("alarmModal").classList.remove("hidden");await loadAlarms()};$("alarmClose").onclick=()=>$ ("alarmModal").classList.add("hidden");
+$("alarmSave").onclick=async()=>{const time=$("alarmTime").value;if(!time)return toast("알람 시간을 선택해 줘.");const [hh,mm]=time.split(":").map(Number),fireAt=new Date();fireAt.setHours(hh,mm,0,0);if(fireAt.getTime()<=Date.now())fireAt.setDate(fireAt.getDate()+1);try{await api("/api/alarms",{method:"POST",body:JSON.stringify({fireAt:fireAt.toISOString(),label:$("alarmLabel").value.trim(),repeat:$("alarmRepeat").checked})});$("alarmLabel").value="";await loadAlarms();toast("서버에 알람을 저장했어.")}catch(e){toast(e.message)}};
+$("alarmStop").onclick=()=>{$("alarmRinging").classList.add("hidden");stopTone()};
+$("notifyBtn").onclick=$ ("railNotify").onclick=enablePush;
 // MySocial 4.0: online list, friend inbox, browser notifications, and saved self-chat
 let onlineIds=new Set(),knownUnread=new Set();
 async function refreshPresence(){try{let d=await api("/api/presence");onlineIds=new Set(d.online);renderUsers()}catch{}}
@@ -108,13 +132,13 @@ $("composer").onsubmit=async e=>{
  if($("chatTitle").textContent==="나와의 채팅"){e.preventDefault();let content=$("messageInput").value.trim();if(!content)return;try{await api("/api/self-messages",{method:"POST",body:JSON.stringify({content})});$("messageInput").value="";await loadSelfNotes()}catch(err){toast(err.message)}return}
  return originalSubmit(e)
 };
-$("notifyBtn").onclick=async()=>{
- if(!("Notification" in window)){toast("이 브라우저는 알림을 지원하지 않아.");return}
- let p=await Notification.requestPermission();toast(p==="granted"?"새 메시지 알림을 켰어.":"알림 권한이 허용되지 않았어.")
-};
+// The notification controls must enable a real PushManager subscription, not permission alone.
+$("notifyBtn").onclick=$("railNotify").onclick=enablePush;
 async function checkMessageNotifications(){
  if(!me||!("Notification" in window)||Notification.permission!=="granted")return;
- for(const u of users){try{let rows=(await api("/api/messages/"+u.id)).messages;let latest=rows.filter(m=>m.to===me.id&&Date.now()-new Date(m.created_at).getTime()<20000).at(-1);if(latest&&!knownUnread.has(latest.id)){knownUnread.add(latest.id);if(!active||active.id!==u.id)new Notification(u.display_name+"님의 새 메시지",{body:latest.content||"첨부 파일"})}}catch{}}
+ for(const u of users){try{let rows=(await api("/api/messages/"+u.id)).messages;let latest=rows.filter(m=>m.to===me.id&&Date.now()-new Date(m.created_at).getTime()<20000).at(-1);if(latest&&!knownUnread.has(latest.id)){knownUnread.add(latest.id);if(!active||active.id!==u.id){playTone(520,.12);new Notification(u.display_name+"님의 새 메시지",{body:latest.content||"첨부 파일"})}}}catch{}}
 }
 const priorRefresh=refresh;
 refresh=async(...args)=>{await priorRefresh(...args);await refreshPresence();await loadFriends();await checkMessageNotifications()};
+
+document.addEventListener("pointerdown",()=>{if(toneContext?.state==="suspended")toneContext.resume().catch(()=>{})},{once:true});
