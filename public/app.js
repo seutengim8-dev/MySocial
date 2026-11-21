@@ -2,7 +2,31 @@ const $=id=>document.getElementById(id);let me=null,users=[],active=null,groups=
 async function api(url,opt={}){let r=await fetch(url,{...opt,headers:{"Content-Type":"application/json",...(opt.headers||{})}}),d=await r.json().catch(()=>({}));if(!r.ok)throw Error(d.error||"요청 실패");return d}
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 function toast(t){$("toasts").textContent=t;$("toasts").className="toast";setTimeout(()=>$("toasts").className="",2500)}
-function enter(){ if("serviceWorker"in navigator)navigator.serviceWorker.register("/sw.js").catch(()=>{}); $("authView").classList.add("hidden");$("appView").classList.remove("hidden");$("topName").textContent=me.display_name;$("meName").textContent=me.display_name;refresh();clearInterval(poll);poll=setInterval(()=>{refresh(false);if(active)loadDM();else if(activeGroup)chooseGroup(activeGroup);else if($("chatTitle").textContent==="나와의 채팅")loadSelfNotes();heartbeat();checkCallInbox();syncCall();refreshPresence()},2500)}
+async function syncExistingPush(){try{if(!me||!('serviceWorker'in navigator)||!('PushManager'in window)||!('Notification'in window)||Notification.permission!=="granted")return;const k=await api("/api/push/public-key");if(!k.enabled)return;const reg=await navigator.serviceWorker.ready;const sub=await reg.pushManager.getSubscription();if(sub)await api("/api/push/subscribe",{method:"POST",body:JSON.stringify({subscription:sub})});}catch(e){console.warn("푸시 구독 동기화 실패:",e.message)}}
+let nativePushListenersReady=false;
+async function registerNativePush(){
+ try{
+  const cap=window.Capacitor,plugin=cap?.Plugins?.PushNotifications;
+  if(!cap||!plugin||!['android','ios'].includes(cap.getPlatform?.()))return;
+  if(!nativePushListenersReady){
+   nativePushListenersReady=true;
+   await plugin.addListener('registration',async token=>{
+    try{await api('/api/native/register',{method:'POST',body:JSON.stringify({platform:cap.getPlatform(),token:token.value})})}
+    catch(e){console.warn('Native push token 저장 실패:',e.message)}
+   });
+   await plugin.addListener('registrationError',e=>console.warn('Native push 등록 실패:',e));
+   await plugin.addListener('pushNotificationActionPerformed',event=>{
+    const data=event.notification?.data||{};
+    if(data.callId)location.href='/?incomingCall='+encodeURIComponent(data.callId);
+    else if(data.url)location.href=data.url;
+   });
+  }
+  let permission=await plugin.checkPermissions();
+  if(permission.receive!=='granted')permission=await plugin.requestPermissions();
+  if(permission.receive==='granted')await plugin.register();
+ }catch(e){console.warn('Native push 초기화 실패:',e.message)}
+}
+function enter(){ if("serviceWorker"in navigator){navigator.serviceWorker.register("/sw.js").then(()=>syncExistingPush()).catch(()=>{});} registerNativePush(); $("authView").classList.add("hidden");$("appView").classList.remove("hidden");$("topName").textContent=me.display_name;$("meName").textContent=me.display_name;refresh();clearInterval(poll);poll=setInterval(()=>{refresh(false);if(active)loadDM();else if(activeGroup)chooseGroup(activeGroup);else if($("chatTitle").textContent==="나와의 채팅")loadSelfNotes();heartbeat();checkCallInbox();syncCall();refreshPresence()},2500)}
 async function refresh(){try{let [u,g]=await Promise.all([api("/api/users"),api("/api/groups")]);users=u.users;groups=g.groups;renderUsers();renderGroups();renderRecent()}catch{}}
 async function login(){try{me=(await api("/api/login",{method:"POST",body:JSON.stringify({email:$("email").value,password:$("password").value})})).user;enter()}catch(e){$("authMsg").textContent=e.message}}
 $("signIn").onclick=login;$("signUp").onclick=async()=>{try{me=(await api("/api/register",{method:"POST",body:JSON.stringify({email:$("email").value,password:$("password").value,displayName:$("displayName").value})})).user;enter()}catch(e){$("authMsg").textContent=e.message}};
@@ -142,3 +166,6 @@ const priorRefresh=refresh;
 refresh=async(...args)=>{await priorRefresh(...args);await refreshPresence();await loadFriends();await checkMessageNotifications()};
 
 document.addEventListener("pointerdown",()=>{if(toneContext?.state==="suspended")toneContext.resume().catch(()=>{})},{once:true});
+
+// Restore an existing server session when a user opens MySocial from a push notification.
+(async()=>{try{const d=await api("/api/me");if(d.user){me=d.user;enter();}}catch{}})();

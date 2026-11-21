@@ -25,6 +25,18 @@ services:
         sync: false
       - key: VAPID_SUBJECT
         value: mailto:admin@example.com
+      - key: FIREBASE_SERVICE_ACCOUNT_BASE64
+        sync: false
+      - key: APNS_KEY_BASE64
+        sync: false
+      - key: APNS_KEY_ID
+        sync: false
+      - key: APNS_TEAM_ID
+        sync: false
+      - key: APNS_PRODUCTION
+        value: "false"
+      - key: IOS_BUNDLE_ID
+        value: com.seutengim8.mysocial
       - key: TURN_URLS
         sync: false
       - key: TURN_USERNAME
