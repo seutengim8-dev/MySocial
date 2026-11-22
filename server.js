@@ -166,5 +166,7 @@ app.post("/api/calls/:cid/ice",(q,s)=>auth(q,s,()=>{let c=db.calls.find(x=>x.id=
 // Server-side alarm dispatcher. Push is delivered to subscribed devices even when the page is closed.
 let alarmDispatchBusy=false;
 setInterval(async()=>{if(alarmDispatchBusy)return;alarmDispatchBusy=true;try{const t=Date.now();if(!vapidReady&&!firebaseApp&&!apnProvider)return;for(const a of [...db.alarms]){if(new Date(a.fireAt).getTime()>t)continue;if(!db.pushSubscriptions.some(x=>x.user===a.user)&&!db.deviceTokens.some(x=>x.user===a.user))continue;sendPush(a.user,{title:"⏰ MySocial 알람",body:a.label||"설정한 알람 시간이야.",url:"/",tag:"alarm-"+a.id});if(a.repeat){const next=new Date(a.fireAt);do{next.setDate(next.getDate()+1)}while(next.getTime()<=t);a.fireAt=next.toISOString();}else db.alarms=db.alarms.filter(x=>x.id!==a.id);await save("alarms");}}catch(e){console.error("알람 처리 오류:",e.message)}finally{alarmDispatchBusy=false}},5000);
-app.get("/download",(q,s)=>s.sendFile(path.join(PUB,"download.html")));\napp.get("*",(q,s)=>s.sendFile(path.join(PUB,"index.html")));
+app.get('/download', (q, s) => s.sendFile(path.join(PUB, "download.html")));
+
+app.get("*", (q, s) => s.sendFile(path.join(PUB, "index.html")));
 initStorage().then(()=>app.listen(PORT,()=>console.log("MySocial 4.5 실행 중: http://localhost:"+PORT))).catch(err=>{console.error("스토리지 초기화 실패:",err);process.exit(1);});
