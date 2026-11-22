@@ -105,14 +105,24 @@ app.post("/api/push/subscribe",(q,s)=>auth(q,s,()=>{if(!vapidReady)return s.stat
 app.delete("/api/push/subscribe",(q,s)=>auth(q,s,()=>{const endpoint=q.body.endpoint;db.pushSubscriptions=db.pushSubscriptions.filter(x=>!(x.user===q.user.id&&x.subscription?.endpoint===endpoint));save("pushSubscriptions");s.json({ok:true})}));
 // Native device registration: FCM token for Android/iOS alerts and APNs VoIP token for iOS calls.
 app.get("/api/native/status",(q,s)=>s.json({firebase:!!firebaseApp,apns:!!apnProvider,voipConfigured:!!(apnProvider&&process.env.IOS_BUNDLE_ID)}));
-app.post("/api/native/register",(q,s)=>auth(q,s,()=>{
+app.post("/api/native/register",(q,s)=>auth(q,s,async()=>{
   const platform=clean(q.body.platform,10),token=clean(q.body.token,4096),voipToken=clean(q.body.voipToken,4096);
   if(!["android","ios"].includes(platform)||!token)return s.status(400).json({error:"기기 플랫폼 또는 푸시 토큰이 올바르지 않아."});
-  db.deviceTokens=db.deviceTokens.filter(x=>!(x.user===q.user.id&&x.platform===platform&&x.token===token));
+  // A native token belongs to one current account/device registration. Reassign stale ownership
+  // after logout/account switching instead of sending notifications to the previous account.
+  db.deviceTokens=db.deviceTokens.filter(x=>!(x.platform===platform&&x.token===token));
   db.deviceTokens.push({id:id(),user:q.user.id,platform,token,voipToken:platform==="ios"?voipToken:null,created_at:now(),updated_at:now()});
-  save("deviceTokens");s.json({ok:true,platform,voipRegistered:platform==="ios"&&!!voipToken});
+  await save("deviceTokens");s.json({ok:true,platform,voipRegistered:platform==="ios"&&!!voipToken});
 }));
-app.post("/api/native/unregister",(q,s)=>auth(q,s,()=>{const token=clean(q.body.token,4096);db.deviceTokens=db.deviceTokens.filter(x=>!(x.user===q.user.id&&x.token===token));save("deviceTokens");s.json({ok:true})}));
+// PushKit token arrives independently from the regular APNs token; attach it to this user's iOS device.
+app.post("/api/native/voip-token",(q,s)=>auth(q,s,async()=>{
+  const token=clean(q.body.token,4096),voipToken=clean(q.body.voipToken,4096);
+  if(!token||!voipToken)return s.status(400).json({error:"APNs 기기 토큰과 VoIP 토큰이 필요해."});
+  const device=db.deviceTokens.find(x=>x.user===q.user.id&&x.platform==="ios"&&x.token===token);
+  if(!device)return s.status(404).json({error:"먼저 일반 iOS 푸시 토큰을 등록해 줘."});
+  device.voipToken=voipToken;device.updated_at=now();await save("deviceTokens");s.json({ok:true,voipRegistered:true});
+}));
+app.post("/api/native/unregister",(q,s)=>auth(q,s,async()=>{const token=clean(q.body.token,4096);db.deviceTokens=db.deviceTokens.filter(x=>!(x.user===q.user.id&&x.token===token));await save("deviceTokens");s.json({ok:true})}));
 app.get("/api/alarms",(q,s)=>auth(q,s,()=>s.json({alarms:db.alarms.filter(a=>a.user===q.user.id).sort((a,b)=>a.fireAt.localeCompare(b.fireAt))})));
 app.post("/api/alarms",(q,s)=>auth(q,s,()=>{const fireAt=new Date(q.body.fireAt);if(!Number.isFinite(fireAt.getTime())||fireAt.getTime()<Date.now()-60000)return s.status(400).json({error:"알람 시간을 다시 확인해 줘."});const a={id:id(),user:q.user.id,label:clean(q.body.label,80)||"알람",fireAt:fireAt.toISOString(),repeat:!!q.body.repeat,created_at:now()};db.alarms.push(a);save("alarms");s.status(201).json({alarm:a,pushEnabled:vapidReady})}));
 app.delete("/api/alarms/:aid",(q,s)=>auth(q,s,()=>{const i=db.alarms.findIndex(a=>a.id===q.params.aid&&a.user===q.user.id);if(i<0)return s.status(404).json({error:"알람을 찾을 수 없어."});db.alarms.splice(i,1);save("alarms");s.json({ok:true})}));
@@ -156,5 +166,5 @@ app.post("/api/calls/:cid/ice",(q,s)=>auth(q,s,()=>{let c=db.calls.find(x=>x.id=
 // Server-side alarm dispatcher. Push is delivered to subscribed devices even when the page is closed.
 let alarmDispatchBusy=false;
 setInterval(async()=>{if(alarmDispatchBusy)return;alarmDispatchBusy=true;try{const t=Date.now();if(!vapidReady&&!firebaseApp&&!apnProvider)return;for(const a of [...db.alarms]){if(new Date(a.fireAt).getTime()>t)continue;if(!db.pushSubscriptions.some(x=>x.user===a.user)&&!db.deviceTokens.some(x=>x.user===a.user))continue;sendPush(a.user,{title:"⏰ MySocial 알람",body:a.label||"설정한 알람 시간이야.",url:"/",tag:"alarm-"+a.id});if(a.repeat){const next=new Date(a.fireAt);do{next.setDate(next.getDate()+1)}while(next.getTime()<=t);a.fireAt=next.toISOString();}else db.alarms=db.alarms.filter(x=>x.id!==a.id);await save("alarms");}}catch(e){console.error("알람 처리 오류:",e.message)}finally{alarmDispatchBusy=false}},5000);
-app.get("*",(q,s)=>s.sendFile(path.join(PUB,"index.html")));
+app.get("/download",(q,s)=>s.sendFile(path.join(PUB,"download.html")));\napp.get("*",(q,s)=>s.sendFile(path.join(PUB,"index.html")));
 initStorage().then(()=>app.listen(PORT,()=>console.log("MySocial 4.5 실행 중: http://localhost:"+PORT))).catch(err=>{console.error("스토리지 초기화 실패:",err);process.exit(1);});
