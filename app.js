@@ -26,10 +26,33 @@ async function registerNativePush(){
   if(permission.receive==='granted')await plugin.register();
  }catch(e){console.warn('Native push 초기화 실패:',e.message)}
 }
-function enter(){ if("serviceWorker"in navigator){navigator.serviceWorker.register("/sw.js").then(()=>syncExistingPush()).catch(()=>{});} registerNativePush(); $("authView").classList.add("hidden");$("appView").classList.remove("hidden");$("topName").textContent=me.display_name;$("meName").textContent=me.display_name;refresh();clearInterval(poll);poll=setInterval(()=>{refresh(false);if(active)loadDM();else if(activeGroup)chooseGroup(activeGroup);else if($("chatTitle").textContent==="나와의 채팅")loadSelfNotes();heartbeat();checkCallInbox();syncCall();refreshPresence()},2500)}
+function setupRailReorder(){
+ const rail=$("appView")?.querySelector(".rail");if(!rail||rail.dataset.sortable==="1")return;rail.dataset.sortable="1";
+ const key="mysocial.rail.order.v1";
+ const apply=()=>{let saved=[];try{saved=JSON.parse(localStorage.getItem(key)||"[]")}catch{};const buttons=[...rail.querySelectorAll("button")];const byId=new Map(buttons.map(b=>[b.id,b]));saved.forEach(id=>{const b=byId.get(id);if(b)rail.appendChild(b)});};
+ apply();let dragging=null;
+ rail.querySelectorAll("button").forEach(btn=>{
+  btn.draggable=true;
+  btn.addEventListener("dragstart",e=>{dragging=btn;btn.classList.add("dragging");e.dataTransfer.effectAllowed="move";e.dataTransfer.setData("text/plain",btn.id)});
+  btn.addEventListener("dragover",e=>{e.preventDefault();if(dragging&&dragging!==btn){btn.classList.add("drop-target");const r=btn.getBoundingClientRect();const horizontal=getComputedStyle(rail).flexDirection==="row";const after=horizontal?e.clientX>r.left+r.width/2:e.clientY>r.top+r.height/2;rail.insertBefore(dragging,after?btn.nextSibling:btn)}});
+  btn.addEventListener("dragleave",()=>btn.classList.remove("drop-target"));
+  btn.addEventListener("drop",e=>{e.preventDefault();btn.classList.remove("drop-target");saveOrder()});
+  btn.addEventListener("dragend",()=>{btn.classList.remove("dragging");rail.querySelectorAll(".drop-target").forEach(x=>x.classList.remove("drop-target"));dragging=null;saveOrder()});
+ });
+ let pointer=null;
+ rail.addEventListener("pointerdown",e=>{const b=e.target.closest("button");if(!b)return;pointer={button:b,x:e.clientX,y:e.clientY,moved:false};});
+ rail.addEventListener("pointermove",e=>{if(!pointer)return;const dx=e.clientX-pointer.x,dy=e.clientY-pointer.y;if(Math.hypot(dx,dy)<8)return;pointer.moved=true;const target=document.elementFromPoint(e.clientX,e.clientY)?.closest(".rail button");if(target&&target!==pointer.button){const r=target.getBoundingClientRect();const horizontal=getComputedStyle(rail).flexDirection==="row";const after=horizontal?e.clientX>r.left+r.width/2:e.clientY>r.top+r.height/2;rail.insertBefore(pointer.button,after?target.nextSibling:target);}});
+ rail.addEventListener("pointerup",()=>{if(pointer?.moved)saveOrder();pointer=null;});
+ rail.addEventListener("pointercancel",()=>{pointer=null;});
+ function saveOrder(){localStorage.setItem(key,JSON.stringify([...rail.querySelectorAll("button")].map(b=>b.id)))}
+}
+function enter(){ setupRailReorder(); if("serviceWorker"in navigator){navigator.serviceWorker.register("/sw.js").then(()=>syncExistingPush()).catch(()=>{});} registerNativePush(); $("authView").classList.add("hidden");$("appView").classList.remove("hidden");$("topName").textContent=me.display_name;$("meName").textContent=me.display_name;refresh();clearInterval(poll);poll=setInterval(()=>{refresh(false);if(active)loadDM();else if(activeGroup)chooseGroup(activeGroup);else if($("chatTitle").textContent==="나와의 채팅")loadSelfNotes();heartbeat();checkCallInbox();syncCall();refreshPresence()},2500)}
 async function refresh(){try{let [u,g]=await Promise.all([api("/api/users"),api("/api/groups")]);users=u.users;groups=g.groups;renderUsers();renderGroups();renderRecent()}catch{}}
-async function login(){try{me=(await api("/api/login",{method:"POST",body:JSON.stringify({email:$("email").value,password:$("password").value})})).user;enter()}catch(e){$("authMsg").textContent=e.message}}
-$("signIn").onclick=login;$("signUp").onclick=async()=>{try{me=(await api("/api/register",{method:"POST",body:JSON.stringify({email:$("email").value,password:$("password").value,displayName:$("displayName").value})})).user;enter()}catch(e){$("authMsg").textContent=e.message}};
+async function login(){try{const d=await api("/api/login",{method:"POST",body:JSON.stringify({email:$("email").value,password:$("password").value})});$("twoFactorView").classList.remove("hidden");$("twoFactorMsg").textContent=d.message||"인증번호를 이메일로 보냈어.";$("twoFactorCode").focus();$("authMsg").textContent="";}catch(e){$("authMsg").textContent=e.message}}
+$("verifyLogin").onclick=async()=>{try{me=(await api("/api/login/verify",{method:"POST",body:JSON.stringify({code:$("twoFactorCode").value})})).user;$("twoFactorView").classList.add("hidden");enter()}catch(e){$("twoFactorMsg").textContent=e.message}};
+$("resendLoginCode").onclick=async()=>{try{const d=await api("/api/login/resend",{method:"POST"});$("twoFactorMsg").textContent=d.message||"새 인증번호를 보냈어.";}catch(e){$("twoFactorMsg").textContent=e.message}};
+$("twoFactorCode").addEventListener("keydown",e=>{if(e.key==="Enter")$("verifyLogin").click()});
+$("signIn").onclick=login;$("signUp").onclick=async()=>{try{await api("/api/register",{method:"POST",body:JSON.stringify({email:$("email").value,password:$("password").value,displayName:$("displayName").value})});$("authMsg").textContent="가입 완료! 이제 이메일 2단계 인증을 진행할게.";$("signUp").disabled=true;await login();}catch(e){$("authMsg").textContent=e.message;}finally{$("signUp").disabled=false}};
 $("logoutBtn").onclick=async()=>{await api("/api/logout",{method:"POST"});location.reload()};
 function renderUsers(){let term=$("userSearch").value.toLowerCase();$("userList").innerHTML=users.filter(u=>u.display_name.toLowerCase().includes(term)).map(u=>`<div class="userrow" data-u="${u.id}"><div class="avatar">${esc(u.profile?.avatar_emoji||u.display_name[0])}</div><div class="meta"><strong>${esc(u.display_name)}</strong><small class="preview">${onlineIds?.has(u.id)?"🟢 온라인":"⚪ 오프라인"} · ${esc(u.profile?.bio||"대화 시작하기")}</small></div></div>`).join("")||'<p class="sub">검색 결과가 없어.</p>';document.querySelectorAll("[data-u]").forEach(x=>x.onclick=()=>choose(users.find(u=>u.id===x.dataset.u)))}
 $("userSearch").oninput=renderUsers;

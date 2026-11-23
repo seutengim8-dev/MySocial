@@ -1,0 +1,10 @@
+MySocial 이메일 2단계 인증 설정
+
+이 수정본은 Resend 이메일 API를 사용해. 서버 환경변수에 다음 두 값을 추가해 줘.
+
+RESEND_API_KEY=re_발급받은_API_키
+MAIL_FROM=MySocial <no-reply@도메인주소>
+
+Resend에서 발신 도메인을 인증한 뒤, 인증된 발신 주소를 MAIL_FROM에 넣어야 실제 이메일이 발송돼.
+키는 index.html이나 app.js에 넣지 말고 Render 등의 서버 환경변수에만 저장해.
+이메일 설정이 없으면 비밀번호만으로 로그인되지 않도록 로그인 자체를 차단해.

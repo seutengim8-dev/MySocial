@@ -92,11 +92,49 @@ function storeUpload(file,resourceType="image"){
   return Promise.resolve({url:"/uploads/"+file.filename,name:file.originalname});
 }
 const authLimiter=rateLimit({windowMs:15*60*1000,limit:20,standardHeaders:"draft-7",legacyHeaders:false,message:{error:"요청이 너무 많아. 잠시 후 다시 시도해 줘."}});
+const otpLimiter=rateLimit({windowMs:15*60*1000,limit:8,standardHeaders:"draft-7",legacyHeaders:false,message:{error:"인증 요청이 너무 많아. 잠시 후 다시 시도해 줘."}});
+const emailOtpReady=!!(process.env.RESEND_API_KEY&&process.env.MAIL_FROM);
+async function sendLoginCode(to,code){
+  if(!emailOtpReady)throw new Error("이메일 인증 발송 설정이 필요해. RESEND_API_KEY와 MAIL_FROM을 서버 환경변수에 등록해 줘.");
+  const response=await fetch("https://api.resend.com/emails",{method:"POST",headers:{"Authorization":"Bearer "+process.env.RESEND_API_KEY,"Content-Type":"application/json"},body:JSON.stringify({from:process.env.MAIL_FROM,to:[to],subject:"MySocial 로그인 인증번호",html:`<div style="font-family:Arial,sans-serif"><h2>MySocial 로그인 인증</h2><p>아래 인증번호를 입력해 줘.</p><p style="font-size:30px;font-weight:bold;letter-spacing:8px">${code}</p><p>인증번호는 5분 동안 유효해. 본인이 요청하지 않았다면 이 메일을 무시해 줘.</p></div>`})});
+  if(!response.ok){const detail=await response.text().catch(()=> "");console.error("인증 메일 발송 실패:",response.status,detail.slice(0,500));throw new Error("인증 메일을 보내지 못했어. 이메일 발송 설정을 확인해 줘.");}
+}
 const safe=u=>({id:u.id,email:u.email,display_name:u.display_name,role:u.role,profile:u.profile||{}});
 function auth(q,s,n){q.user=db.users.find(u=>u.id===q.session.uid);if(!q.user)return s.status(401).json({error:"로그인이 필요해."});n()}
 app.get("/api/health",(q,s)=>s.json({ok:true,storage:pool?"postgresql":"local-json",media:cloudinaryEnabled?"cloudinary":"local-disk"}));
 app.post("/api/register",authLimiter,async(q,s)=>{let email=clean(q.body.email,120).toLowerCase(),pw=q.body.password||"";if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))return s.status(400).json({error:"이메일을 확인해 줘."});if(pw.length<8||pw.length>72)return s.status(400).json({error:"비밀번호는 8~72자여야 해."});if(db.users.some(u=>u.email===email))return s.status(409).json({error:"이미 가입된 이메일이야."});let u={id:id(),email,passwordHash:await bcrypt.hash(pw,12),display_name:clean(q.body.displayName,30)||email.split("@")[0],role:"user",profile:{bio:"",avatar_emoji:"",theme:0},created_at:now()};db.users.push(u);save("users");q.session.uid=u.id;s.status(201).json({user:safe(u)});});
-app.post("/api/login",authLimiter,async(q,s)=>{let u=db.users.find(x=>x.email===clean(q.body.email,120).toLowerCase());if(!u||!await bcrypt.compare(q.body.password||"",u.passwordHash))return s.status(401).json({error:"이메일 또는 비밀번호가 맞지 않아."});q.session.uid=u.id;s.json({user:safe(u)});});
+app.post("/api/login",authLimiter,async(q,s)=>{
+  let u=db.users.find(x=>x.email===clean(q.body.email,120).toLowerCase());
+  if(!u||!await bcrypt.compare(q.body.password||"",u.passwordHash))return s.status(401).json({error:"이메일 또는 비밀번호가 맞지 않아."});
+  if(!emailOtpReady)return s.status(503).json({error:"2단계 이메일 인증이 아직 설정되지 않았어. 운영자가 RESEND_API_KEY와 MAIL_FROM을 등록해야 로그인할 수 있어."});
+  const code=String(crypto.randomInt(0,1000000)).padStart(6,"0");
+  try{await sendLoginCode(u.email,code);}catch(e){return s.status(503).json({error:e.message});}
+  q.session.uid=null;
+  q.session.loginChallenge={userId:u.id,codeHash:crypto.createHash("sha256").update(code).digest("hex"),expiresAt:Date.now()+5*60*1000,attempts:0,lastSentAt:Date.now()};
+  s.json({ok:true,requiresEmailVerification:true,message:"인증번호를 가입된 이메일로 보냈어. 5분 안에 입력해 줘."});
+});
+app.post("/api/login/verify",otpLimiter,async(q,s)=>{
+  const c=q.session.loginChallenge;
+  if(!c)return s.status(400).json({error:"진행 중인 로그인 인증이 없어. 다시 로그인해 줘."});
+  if(Date.now()>c.expiresAt){delete q.session.loginChallenge;return s.status(400).json({error:"인증번호가 만료됐어. 다시 로그인해 줘."});}
+  if(++c.attempts>5){delete q.session.loginChallenge;return s.status(429).json({error:"인증번호 입력 횟수를 초과했어. 다시 로그인해 줘."});}
+  const code=clean(q.body.code,6),hash=crypto.createHash("sha256").update(code).digest("hex");
+  const a=Buffer.from(hash),b=Buffer.from(c.codeHash);
+  if(!/^\\d{6}$/.test(code)||a.length!==b.length||!crypto.timingSafeEqual(a,b))return s.status(401).json({error:"인증번호가 올바르지 않아."});
+  const u=db.users.find(x=>x.id===c.userId);delete q.session.loginChallenge;
+  if(!u)return s.status(401).json({error:"계정을 찾을 수 없어. 다시 로그인해 줘."});
+  q.session.uid=u.id;s.json({user:safe(u)});
+});
+app.post("/api/login/resend",otpLimiter,async(q,s)=>{
+  const c=q.session.loginChallenge;
+  if(!c)return s.status(400).json({error:"진행 중인 로그인 인증이 없어. 다시 로그인해 줘."});
+  if(Date.now()-c.lastSentAt<60*1000)return s.status(429).json({error:"인증번호는 1분 후에 다시 보낼 수 있어."});
+  const u=db.users.find(x=>x.id===c.userId);if(!u){delete q.session.loginChallenge;return s.status(404).json({error:"계정을 찾을 수 없어."});}
+  const code=String(crypto.randomInt(0,1000000)).padStart(6,"0");
+  try{await sendLoginCode(u.email,code);}catch(e){return s.status(503).json({error:e.message});}
+  c.codeHash=crypto.createHash("sha256").update(code).digest("hex");c.expiresAt=Date.now()+5*60*1000;c.attempts=0;c.lastSentAt=Date.now();
+  s.json({ok:true,message:"새 인증번호를 이메일로 보냈어."});
+});
 app.post("/api/logout",(q,s)=>q.session.destroy(()=>s.json({ok:true})));
 app.get("/api/me",(q,s)=>auth(q,s,()=>s.json({user:safe(q.user)})));
 app.get("/api/push/public-key",(q,s)=>s.json({enabled:vapidReady,publicKey:vapidReady?process.env.VAPID_PUBLIC_KEY:null}));
